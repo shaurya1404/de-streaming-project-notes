@@ -52,10 +52,32 @@ print(f"SharedAccessSignature sr={sr}&sig={urllib.parse.quote_plus(sig)}&se={exp
 
 Define the flat JSON template that includes fields such as `uuid`, `distinct_id`, `gym_slot`, `total_steps`, `workout_name`. So, each event is data stored in the payload of the request in the form of a serialized JSON String.
 
+### Azure Data Factory
+
 - Step 8: Azure Data Factory Initialization
 
 ADF is Azure's managed service for data orchestration between systems. It's used for incremental batch ingestion of data from a database or SaaS application into a Data Lakehouse - thus, it complements the Event Hub architecture as one streams data in near real-time into the Bronze layer and the other incrementally batch loads data into the Bronze layer on a schedule.
 
 ADF will be used in this project to:
 (1) batch ingest all historical events that currently exist within PostHog before stream was implemented and 
-(2) to ingest dimensions data on a shcedule into the Lakehouse that will be joined with the facts data (streamed events). The streamed events currently only consists of factual data - thus, in order to enrich the data and give it more context, it will be joined to all the dimensional data pulled from the PostgreSQL database via ADF.
+(2) to ingest dimensions data on a schedule into the Lakehouse that will be joined with the facts data (streamed events). The streamed events currently only consists of factual data - thus, in order to enrich the data and give it more context, it will be joined to all the dimensional data pulled from the PostgreSQL database via ADF.
+
+#### Author Tab
+
+The Author tab is where you build things in Azure Data Factory, and its Factory Resources panel lists the types of objects you can build:
+
+1) Pipeline: A set of activities connected in order, with rules for what happens on success or failure. An Activity can be a Movement (copying of data from source to destination), Transformation ( a Databricks notebook or stored procedure), if-else conditions for dynamic pipeline control
+
+2) Datasets: A named reference to a specific piece of data: a table, a file or a folder with metadata such as its format and schema. It holds no data itself.
+
+3) Data Flow: No-code, visual transformations like filters, aggregates, joins, etc. Power Query is the same except it's a Power BI style query editor style (for Data Analysts)
+
+4) Change Data Capture: Unlike a pipeline, a resource that runs continuously. It tracks changes to data given by the source database such as inserts, updates, deletes and applies them to the destination.
+
+- Step 9: Batch Export Data from PostHog to Data Lakehouse
+
+Backfilling all historical data (1st April, 2026 - 7th October, 2026) from PostHog in the form of Parquet files partitoned via 
+date (`{table}/{year}/{month}/{day}/`) into the Storage account with hierarchical namespace enabled (makes it a data lake).
+
+PostHog connects to our Storage account via its Connection string and exports all the data into the Container `landing`, i.e, the Data LAKE layer since PostHog exports in the form of plain Parquet files, not Delta files. The Bronze layer is where the Data LAKEHOUSE architecture begins.
+
