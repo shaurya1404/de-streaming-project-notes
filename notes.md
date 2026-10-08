@@ -1,0 +1,61 @@
+# Azure Databricks Streaming Project
+
+## Overview
+
+An end-to-end data engineering pipeline on real user activity from Apex - my Fitness Streak Tracker App live on the app store I built as a solo developer. For Analytics purposes, the app already sends events based on real user activity to PostHog. The data is now forwarded directly to Azure Event Hubs where the data pipeline initiates. PostHog uses an HTTP Webhook and communicates the Events in near real-time via a REST API (since PostHog doesn't offer a Native connection to Azure yet). From the hub, a Spark Declarative Pipeline will process the stream through bronze, silver and gold layers: deduplicating on event ID and pairing start and outcome events with stateful logic. The result is a star schema with separate fact tables for workouts, gym check-ins, social activity, onboarding and app reliability. Alongside the stream, Azure Data Factory will run the batch side: scheduled incremental loads of user, workout and gym tables from the app's database to serve as dimensions, and a backfill of historical events. Together they show how streaming facts and batch dimensions combine in one lakehouse model.
+
+## Implementation
+
+1) Event Hub
+
+Event Hub is Azure's managed service for streaming events: a highly-scalable, append-only log that acts as the storage buffer between apps producing events and others consuming it. It is Azure's equivalent of Apache Kafka.
+
+It allows Decoupling since the Producers and Consumers don't need to know about each other
+
+- Step 1: Create Resource Group
+
+- Step 2: Create Event Hub Namespace
+
+- Step 3: Create Event Hub Instance
+
+### Event Hub Namespace vs Instance
+
+Namespace is the top-level container that has a unique address `<namespace>.servicebus.windows.net`. It consists of one or more instances.
+The Namespace includes configurations like Region, Pricing tier, Capacity (Throughput units) that are shared among all the instances. 
+An Instance includes configurations unique to the stream such as Retention period and Partition count
+
+-  Step 4: Create Access Policy: In the Event Hub Instance, create a Send-Only Access Policy such that Posthog API requests can be autheticated and accepted into the Event Hub instance as a producer. 
+
+- Step 5: Generate a Shared Access Signature (SAS) using the Primary key given by the Send Policy using the following Python script since the Portal gives us the Key, not the entire Authorization token needed by the Webhook:
+
+```python
+import time, hmac, hashlib, base64, urllib.parse
+
+uri = "https://<namespace>.servicebus.windows.net/<instance>"
+key_name, key = "<policy-name>", "<primary-key>"
+expiry = int(time.time()) + 365 * 24 * 3600  # 1 year
+
+sr = urllib.parse.quote_plus(uri)
+sig = base64.b64encode(
+    hmac.new(key.encode(), f"{sr}\n{expiry}".encode(), hashlib.sha256).digest()
+)
+print(f"SharedAccessSignature sr={sr}&sig={urllib.parse.quote_plus(sig)}&se={expiry}&skn={key_name}") # token
+```
+
+- Step 6: Webhook Config in PostHog
+    Webhook Endpoint: `https://<namespace>.servicebus.windows.net/<eventhub>/messages`
+    HTTP Method-Type: POST
+    Authorization Header: <token>
+    Content-Type Token: `application/json`
+
+- Step 7: Defining the Payload Template in PostHog
+
+Define the flat JSON template that includes fields such as `uuid`, `distinct_id`, `gym_slot`, `total_steps`, `workout_name`. So, each event is data stored in the payload of the request in the form of a serialized JSON String.
+
+- Step 8: Azure Data Factory Initialization
+
+ADF is Azure's managed service for data orchestration between systems. It's used for incremental batch ingestion of data from a database or SaaS application into a Data Lakehouse - thus, it complements the Event Hub architecture as one streams data in near real-time into the Bronze layer and the other incrementally batch loads data into the Bronze layer on a schedule.
+
+ADF will be used in this project to:
+(1) batch ingest all historical events that currently exist within PostHog before stream was implemented and 
+(2) to ingest dimensions data on a shcedule into the Lakehouse that will be joined with the facts data (streamed events). The streamed events currently only consists of factual data - thus, in order to enrich the data and give it more context, it will be joined to all the dimensional data pulled from the PostgreSQL database via ADF.
