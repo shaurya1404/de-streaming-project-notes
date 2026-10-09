@@ -118,7 +118,29 @@ GRANT USAGE ON SCHEMA analytics TO adf_reader;
 GRANT SELECT ON analytics.users_masked TO adf_reader;
 ```
 
-- Step 10.4: Create Linked Service in ADF to PostgreSQL
+- Step 10.4: Create RLS Policies
+
+GRANT and RLS policies are two separate checks that answer different questions, and a query has to pass both.
+`GRANT SELECT` works at the table level. It decides whether the role may run a SELECT against the table at all.
+An RLS policy works at the row level. It decides which rows that role can see once it's allowed in.
+
+When RLS is enabled on a table, Postgres applies a default-deny rule: a role sees only the rows that some policy allows for it. If no policy applies to the role, the set of visible rows is empty.
+
+```sql
+CREATE POLICY "adf_reader can read workouts"
+ON public.workouts
+FOR SELECT
+TO adf_reader -- role to apply policy to
+USING (true); -- predicate condition: rows that return TRUE are displayed
+
+CREATE POLICY "adf_reader can read gyms"
+ON public.gyms
+FOR SELECT
+TO adf_reader
+USING (true);
+```
+
+- Step 10.5: Create Linked Service in ADF to PostgreSQL
 
 Using the 'Session Pooler' Connection string in Supabase to expose an end-point that ADF can connect to. 'Session Pooler' is an alternative to direct connection (which uses IPv6) when connecting via an IPv4 network. ADF defaults to IPv4 network connections.
 
@@ -131,3 +153,42 @@ However, TLS (formerly SSL) provides two layers of security on the connection:
 We're setting SSL Mode to 'Require' in the Linked Service. This implies that TLS must only guarantee Encryption, not Identity Verification. 
 Hence, an additional key-value field must be passed in the Linked Service explicitly stating that we trust whatever certificate the server returns without needing to verify it (`TrustServerCertificate = true`).
 
+## Datasets
+
+How do I connect to a system? Linked Service - Host, port, database, user name, password
+Which data in that system? Dataset - Schema and table
+What to do with the data? Activity - Copy to the lake
+
+A dataset is a reference to the data sitting in one of the external systems that we're connected to via a Linked Service. So, every dataset refers to exactly one Linked Service. Additionally, it also stores metadata to interpret the data such as its format and schema.
+
+One linked service supports many datasets, and one dataset can be used by many activities.
+
+- Step 11: Create Source Dataset (PostgreSQL)
+
+Create Dataset via the PostgreSQL Linked Service and define Schema and Table as parameters
+
+- Step 12: Create Sink Dataset (Data Lake)
+
+Create Dataset via the Data Lake Linked Service to connect to the Storage Account. Select 'landing' as the Container and 
+`@concat('dimensions/', dataset().folder)` as the Directory in order to parameterize the created directories (not dataset().table since our View is named 'users_masked' instead of 'users').
+
+The 'landing' container is part of the Data Lake since that's where all external systems write to in the form of plain parquet files. The bronze, silver, and gold layers are what the SDP will operate on and produce Delta files within - hence, making that a Delta Lake.
+
+### Parameterized Datasets
+
+A dataset pointing at one fixed table means ten tables need ten source datasets and ten sink datasets.
+We define parameters on the dataset such as `@dataset().table`. The activity then supplies its value during runtime.
+
+Hence, one source dataset defined for all the schemas and tables. One sink dataset referring to different folders in the Data Lake.
+
+**Pipeline parameter**: Referred in activities via `@pipeline().parameters.x`
+Input passed at the start of a pipeline run that makes it dynamic. Available to every activity in the pipeline, but never passed automatically.
+
+**Dataset parameter**: Referred in datasets via `@dataset().x`
+Input passed into a dataset everytime it is used by an activity. Makes it dynamic by enabling reference to more than one schema and table.
+
+Value Chain in Dimension Load Pipeline: pipeline parameter `tables` → ForEach Items → `@item()` → dataset parameters
+- ForEach reads `@pipeline().parameters.tables` as the 'Items' iterable it requires.
+- Every forEach iteration exposes each entry as `@item()`
+- Copy reads `@item().schema`, `@item().table`, `@item().folder` and passes them to the datasets.
+- Datasets only see their own parameters via `@dataset().x`
