@@ -192,3 +192,13 @@ Value Chain in Dimension Load Pipeline: pipeline parameter `tables` → ForEach 
 - Every forEach iteration exposes each entry as `@item()`
 - Copy reads `@item().schema`, `@item().table`, `@item().folder` and passes them to the datasets.
 - Datasets only see their own parameters via `@dataset().x`
+
+## ForEach Activity
+
+A control activity in ADF Pipelines that runs the same set of inner activities once for each element of an ARRAY. It's the pipeline equivalent of a for loop.
+
+**Items**: The array to loop over. It can come from a pipeline parameter, such as `@pipeline().parameters.tableNames`, or from an earlier activity's output, such as a Lookup or Get Metadata.
+
+This allows Copy activity looping over users, workouts and gyms, instead of three near-identical pipelines.
+
+**Copy Activity**: ADF's core data migration tool. It reads from a source, optionally converts the format, and writes to a sink (destination).
