@@ -228,4 +228,45 @@ Landing: dimensions ──> bronze_users/workouts/gyms ─> silver_users/workout
 
 - Step 3: Create a Storage Credential to the Storage Account and three External Locations to the three Containers
 
-- Step 4: Create a Catalog 'apex' and three Schemas with Managed Locations as the three containers
+- Step 4: Create a Catalog 'apex' and 'bronze', 'silver, and 'gold' Schemas with Managed Locations as the three containers
+
+### bronze_dimensions.py
+
+Creating the ETL pipeline first, then writing its logic as plain Python or SQL files inside the pipeline’s project folder. This contrasts with the older approach wherein we defined first wrote the SDP code independently in notebooks and attached them to the piepline afterwards. 
+
+Both have the same performance. The ETL-Pipeline-First approach is preferred since it allows easier development.
+
+Pipeline Project Folder Structure:
+`transformations/`: the pipeline’s source code. Every file here is included automatically, so a new file needs no settings change.
+`explorations/`: notebooks for interactive checks. They sit beside the project but are not run by the pipeline.
+`utilities/`: shared Python code, such as schemas or helper functions, imported like a normal module.
+
+Dry run: validates the code and builds the graph without processing data. Use it to catch errors cheaply.
+Run pipeline: processes only new data for streaming tables and brings materialized views up to date.
+Full refresh: discards a table’s data and state and rebuilds from the source. Be careful with this on the Event Hubs table, because the hub only retains events for a limited time, so anything older would be lost for good.
+
+- Step 5: Creating `bronze_dimensions.py`
+
+Creating the script that ingests the three dimensions table from the Data Lake (landing) into the Bronze layer
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions
+from pyspark.sql.functions import col
+
+landing = 'abfss://landing@<dl***>.dfs.core.windows.net/dimensions'
+def all_bronze_dimensions(table_name):
+    @dp.materialized_view(
+        name = f"apex.bronze.{table_name}",
+        comment = f"Bronze table for {table_name} that ingests raw data from Landing into Delta Lake"
+    )
+
+    def bronze_dimension():
+        return (
+            spark.read.format('parquet').load(f"{landing}/{table_name}") \
+            .withColumn('file_path', col('_metadata.file_path')) \
+            .withColumn('file_modification_time', col('_metadata.file_modification_time'))
+        )
+for table_name in ['users', 'gyms', 'workouts']:
+    all_bronze_dimensions(table_name)
+```
