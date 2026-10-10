@@ -144,7 +144,7 @@ USING (true);
 
 Using the 'Session Pooler' Connection string in Supabase to expose an end-point that ADF can connect to. 'Session Pooler' is an alternative to direct connection (which uses IPv6) when connecting via an IPv4 network. ADF defaults to IPv4 network connections.
 
-Created Linked Service in ADF uses `Host`, `Port`, `Database`, `User name`, and `Password` fields that are provided by the Session pooler connection string.
+Created Linked Service in ADF uses `Host`, `Port`, `Database`, `User name`, and `Password` fields that are provided by the Session Pooler connection string.
 
 However, TLS (formerly SSL) provides two layers of security on the connection:
 1) Encryption: Ensures data in transit is encrypted
@@ -202,3 +202,30 @@ A control activity in ADF Pipelines that runs the same set of inner activities o
 This allows Copy activity looping over users, workouts and gyms, instead of three near-identical pipelines.
 
 **Copy Activity**: ADF's core data migration tool. It reads from a source, optionally converts the format, and writes to a sink (destination).
+
+**Trigger**: ADF Pipeline Trigger set for a daily schedule which overwrites the same 3 files with the current state of the source. No performance issues on small dimensions tables such as in our case.
+
+## Spark Declarative Pipeline
+
+Implementing the SDP that ingests data from the data lake layer 'landing' and performs ETL transformations
+
+SOURCES                 BRONZE                       SILVER                    GOLD
+
+Event Hubs ───────────> bronze_events_stream ───┐
+(live events)           [streaming table]       ├──> silver_events ──────────> Fact tables
+                                                │    [streaming table]         [materialized views]
+Landing: backfill ────> bronze_events_backfill ─┘    unified, deduplicated       ^
+(event files)           [streaming table]                                        │
+                                                                                 │
+Landing: dimensions ──> bronze_users/workouts/gyms ─> silver_users/workouts/gyms ┤
+(overwritten files)     [materialized views]          [materialized views]       │
+                                                      typed, no PII              └──> Dimension tables
+                                                                                      [materialized views]
+
+- Step 1: Create Bronze, Silver, and Gold layers in the ADLS Gen2 Storage Account as distinct containers
+
+- Step 2: Create Access Connector and grant 'Storage Blob Data Contributor' on the Storage Account
+
+- Step 3: Create a Storage Credential to the Storage Account and three External Locations to the three Containers
+
+- Step 4: Create a Catalog 'apex' and three Schemas with Managed Locations as the three containers
