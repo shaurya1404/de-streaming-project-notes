@@ -232,7 +232,7 @@ Landing: dimensions ──> bronze_users/workouts/gyms ─> silver_users/workout
 
 ### bronze_dimensions.py
 
-Creating the ETL pipeline first, then writing its logic as plain Python or SQL files inside the pipeline’s project folder. This contrasts with the older approach wherein we defined first wrote the SDP code independently in notebooks and attached them to the piepline afterwards. 
+Creating the ETL pipeline first, then writing its logic as plain Python or SQL files inside the pipeline’s project folder. This contrasts with the older approach wherein we first wrote the SDP code independently in notebooks and attached them to the pipeline afterwards. 
 
 Both have the same performance. The ETL-Pipeline-First approach is preferred since it allows easier development.
 
@@ -270,3 +270,64 @@ def all_bronze_dimensions(table_name):
 for table_name in ['users', 'gyms', 'workouts']:
     all_bronze_dimensions(table_name)
 ```
+
+### bronze_batch_events.py
+
+Identifying schema of Batch Events in the landing layer to ensure PII is removed before loading into the Bronze layer
+
+```python
+path = "abfss://landing@dlstreamprojdev.dfs.core.windows.net/events/"
+df = spark.read.option("recursiveFileLookup", "true").parquet(path) # DataFrame Reader API by default only looks into files directly in the folder
+df.printSchema()
+display(df.limit(5))
+print(df.count())
+```
+
+Dropping the entire 'person_properties' column and some keys in the 'properties' column to filter out PII.
+
+#### Struct vs Map
+
+Two ways to describe a JSON Object.
+
+Struct asks for the name and type of each field - any fields not mentioned are dropped. It allows different types for each field.
+`struct<'$session_id':string, '$screen_width':int, method:string, ...>`
+
+Map asks for one type for all keys and one type for all values. The keys in the JSON don't have to be listed. Value types for all keys are the same
+`map<string, string>` 
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+landing = 'abfss://landing@dlstreamprojdev.dfs.core.windows.net/events'
+
+SENSITIVE_KEYS = [
+    "$ip",
+    "$geoip_latitude",
+    "$geoip_longitude",
+    "$geoip_postal_code",
+    "$set",
+    "$set_once",
+]
+
+@dp.table(
+    name='apex.bronze.batch_events',
+    comment='Ingesting raw events for backfilled data that also runs daily for present data with PII removed'
+)
+
+def batch_and_backfill_events():
+    return (
+        spark.readStream.format('cloudFiles') \
+            .option('cloudFiles.format', 'parquet') \
+            .option('pathGlobFilter', '*.parquet') # ensures only parquet files are ingested
+            .load(landing) \
+            .drop('person_properties') \
+            .withColumn('properties', F.map_filter(F.from_json('properties', 'map<string, string>'),
+                                                   lambda key,val: ~key.isin(SENSITIVE_KEYS)))
+            .withColumn('_ingested_at', F.current_timestamp())
+            .withColumn('_source_file', F.col('_metadata.file_path'))
+    )
+```
+
+`from_json()` parses the JSON String 'properties' column into a JSON Map. Thus, each key-value pair is now accessible, enabling us to remove keys that include Sensitive PII.
+
