@@ -277,7 +277,7 @@ Identifying schema of Batch Events in the landing layer to ensure PII is removed
 
 ```python
 path = "abfss://landing@dlstreamprojdev.dfs.core.windows.net/events/"
-df = spark.read.option("recursiveFileLookup", "true").parquet(path) # DataFrame Reader API by default only looks into files directly in the folder
+df = spark.read.option("recursiveFileLookup", "true").parquet(path) # DF Reader API only looks into files directly in the load folder by default
 df.printSchema()
 display(df.limit(5))
 print(df.count())
@@ -331,3 +331,67 @@ def batch_and_backfill_events():
 
 `from_json()` parses the JSON String 'properties' column into a JSON Map. Thus, each key-value pair is now accessible, enabling us to remove keys that include Sensitive PII.
 
+***Note***: Unlike the DataFrame Reader API, Auto Loader looks up the load path recursively by default. So, pointing it at the 'events' folder picks up every file in every date subfolder, however deep.
+
+### bronze_stream_events.py
+
+First, creating a Secret in the workspace to store the EventHub's listenPolicy connection string that's needed to authenticate Databricks to listen to the EventHub instance.
+
+All workspace-local resource manipulations via the Databricks UI (creating jobs, managing clusters, storing secrets) can also be done in Python code via the `WorkspaceClient` API
+
+```python
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+w.secrets.create_scope(scope='apex')
+w.secrets.put_secret(
+    scope='apex',
+    key='eventhubs-listen-connection',
+    string_value='Endpoint=sb://***'
+)
+```
+***Note***: `scope` is a named container for secrets 
+
+Creating `transformations/bronze_stream_events.py`
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+EH_namespace = 'streaming-project-events'
+EH_instance = 'streaming-project-topic'
+
+connection_string = dbutils.secrets.get(scope='apex', key='eventhubs-listen-connection')
+
+@dp.table(
+    name='apex.bronze.stream_events',
+    comment='Ingesting raw events from Event Hub into the Bronze layer'
+)
+
+def ingest_stream_events():
+    return (
+        spark.readStream.format('kafka') \
+        .option('kafka.bootstrap.servers', f'{EH_namespace}.servicebus.windows.net:9093')
+        .option('subscribe', f'{EH_instance}')
+        .option('kafka.security.protocol', 'SASL_SSL')
+        .option('kafka.sasl.mechanism', 'PLAIN')
+        .option('kafka.sasl.jaas.config', f"kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required username='$ConnectionString' password='{connection_string}';")
+        .option('startingOffsets', 'earliest')
+        .load()
+        .select(F.col('value').cast('string').alias('body'), F.col('partition'), F.col('offset'), F.col('timestamp').alias('enqueued_at'), F.current_timestamp().alias('_ingested_at'))
+    )
+```
+
+To connect with EventHub, it is treated like Kafka - the namespace is the Kafka server, using port 9093, and the instance is the topic.
+
+`kafka.security.protocol: SASL_SSL`: Sets how the connection is secured. `SSL` means all traffic is encrypted in transit (TLS). `SASL` means the client must authenticate before it can do anything. Both are required by EventHub to allow a connection from the client.
+
+`kafka.sasl.mechanism: PLAIN`: Implies that we're using a simple username and password authentication
+
+`kafka.sasl.jaas.config`: Supplies the actual credentials for login
+`kafkashaded...PlainLoginModule`: Databricks-specific config
+`username="$ConnectionString`: A fixed, literal value that tells EventHub that the password is a connection string
+
+`value` arrives as bytes - casting it to a string yields the JSON body
+`partition` and `offset` uniquely identify each message.
+`failOnDataLoss: false` is set to true by default that fails the pipeline in cases wherein the checkpoint expects to read offset 500 but the earliest avaiable one at the time of the pipeline run is 800 - this implies data was lost between subsequent runs so default behaviour is to fail
