@@ -290,7 +290,7 @@ Dropping the entire 'person_properties' column and some keys in the 'properties'
 Two ways to describe a JSON Object.
 
 Struct asks for the name and type of each field - any fields not mentioned are dropped. It allows different types for each field.
-`struct<'$session_id':string, '$screen_width':int, method:string, ...>`
+`struct<$session_id:string, $screen_width:int, method:string, ...>`
 
 Map asks for one type for all keys and one type for all values. The keys in the JSON don't have to be listed. Value types for all keys are the same
 `map<string, string>` 
@@ -395,3 +395,197 @@ To connect with EventHub, it is treated like Kafka - the namespace is the Kafka 
 `value` arrives as bytes - casting it to a string yields the JSON body
 `partition` and `offset` uniquely identify each message.
 `failOnDataLoss: false` is set to true by default that fails the pipeline in cases wherein the checkpoint expects to read offset 500 but the earliest avaiable one at the time of the pipeline run is 800 - this implies data was lost between subsequent runs so default behaviour is to fail
+
+### silver_events.py
+
+`apex.silver.events` combines both event sources, gives columns proper types, removes out-of-scope events and keeps one row per event (uuid)
+
+`apex.bronze.stream_events`: One JSON String per event in `body` + partition, offset, enqueued_at, _ingested_at
+`apex.bronze.batch_events`: Core columns (uuid, event, timestamp) + `properties` column of type JSON Object/Map `map<string, string>`
+
+Stream -> JSON String with plain names (city, session_id) in the `body` column, because the webhook template renamed them.
+Batch -> PostHog’s original names inside the JSON Map ($geoip_city_name, $session_id), all values as text ("402", "true").
+
+- The 4 Datasets
+`stream_conformed`: Temporary View. Used to parse the JSON String and pivot each key into a column
+`batch_conformed`: Temporary View. Used to pull out same columns from the JSON Map and give them the same name 
+`events_unioned`: Temporary View. Used to combine the two via `unionByName`, type the columns, and performs data quality checks
+`apex.silver.events`: Streaming Table. Used to dedup on `uuid` using AUTO CDC
+
+How are we merging two sources having different schema? Conform both to one schema, convert all columns to StringType(), union them, then cast back
+
+#### PROPERTY FIELDS and CORE FIELDS
+
+First, creating a dictionary `PROPERTY_FIELDS` for Batch Events that consists of keys as the expected silver table column headers and values as their corresponding fields in the 'properties' column of Batch Events. 
+
+Note that Stream events already has its fields renamed to the keys of this dictionary.
+
+```python
+PROPERTY_FIELDS = {
+    "session_id": "$session_id",
+    "is_identified": "$is_identified",
+    "app_version": "$app_version",
+    "app_build": "$app_build",
+    "device_name": "$device_name",
+    "device_type": "$device_type",
+    "os_name": "$os_name",
+    "os_version": "$os_version",
+    "locale": "$locale",
+    "timezone": "$timezone",
+    "city": "$geoip_city_name",
+    "region": "$geoip_subdivision_1_name",
+    "country_code": "$geoip_country_code",
+    "workout_name": "workout_name",
+    "gym_slot": "gym_slot",
+    "is_change": "is_change",
+    "reason": "reason",
+    "method": "method",
+    "missing_email": "missing_email",
+    "permission_type": "type",
+    "new_goal": "new_goal",
+    "new_tier": "new_tier",
+    "nudge_type": "nudgeType",
+    "result": "result",
+    "tour_id": "tour_id",
+    "total_steps": "total_steps",
+    "steps_viewed": "steps_viewed",
+    "release_key": "release_key",
+    "total_features": "total_features",
+    "feature_id": "feature_id",
+    "step_number": "step_number",
+    "elapsed_ms": "elapsedMs",
+    "cached_token_present": "cachedTokenPresent",
+}
+```
+
+To define the SCHEMA of the Stream Events data, we're using the keys in `PROPERTY_FIELDS` as well as a `CORE_FIELDS` list which is essentially all the remaining fields in the Stream Events outside of the fields listed in `PROPERTY_FIELDS`
+
+```python
+CORE_FIELDS = ["uuid", "event", "timestamp", "captured_at", "distinct_id", "person_id"]
+```
+
+Now, defining the STREAM_SCHEMA which will be used to convert the JSON String `body` to JSON Struct with all fields of type StringType()
+The `CORE_FIELDS` will first be explicitly converted back to their original types since Batch Events already have those in their original types too
+
+```python
+STREAM_SCHEMA = StructType([StructField(name, StringType()) for name in CORE_FIELDS + list(PROPERTY_FIELDS)])
+
+@dp.temporary_view()
+def stream_conformed():
+    parsed = spark.readStream.table('apex.bronze.stream_events') \
+        .withColumn('e', F.from_json('body', STREAM_SCHEMA))
+    return (
+        parsed.select(
+            F.col('e.uuid').alias('uuid'), # explicit casting of CORE_FIELDS first
+            F.col('e.event').alias('event'),
+            F.col('e.timestamp').cast(Timestamp()).alias('event_time'),
+            F.col('e.captured_at').cast(Timestamp()).alias('captured_at'),
+            F.col('e.distinct_id').alias('distinct_id'),
+            F.col('e.person_id').alias('person_id'),
+            *[F.col(f'e.{name}').alias(f'{name}') for name in PROPERTY_FIELD], # *[] unpacks all elements of the list of column expressions
+            F.lit('stream').alias('source'),
+            F.col('_ingested_at')
+        )
+    )
+```
+
+`list(PROPERTY_FIELDS)`: Storing a dictionary as a list stores all its keys only
+`PROPERTY_FIELD`: Iterating over a dictionary directly only gives access to its keys
+`PROPERTY_FIELDS.items()`: Iterating with .items() over the dictionary gives access to its key-value pairs
+
+Now, the CORE_FIELDS already exist in the Batch Events as columns, so keeping them as it is. Then, extracting PROPERTY_FIELDS from the 'property' map with renamed column headers
+
+```python
+@dp.temporary_view()
+def batch_events():
+    return (
+        spark.readStream.table('apex.bronze.batch_events').select(
+            F.col('uuid'),
+            F.col('event'),
+            F.col('timestamp').alias('event_time'),
+            F.lit(None).cast(Timestamp()).alias('captured_at'), # lit(None) == NULL - thus, can be converted to any data type
+            F.col('distinct_id'),
+            F.col('person_id'),
+            *[F.col(f'{val}').alias(f'{key}') for key, val in PROPERTY_FIELDS.items()]
+            F.lit('batch').alias('source')
+            F.col('_ingested_at')
+        )
+    )
+```
+
+Both `stream_conformed` and `batch_conformed` have the same schema and hence, are union-compatible
+Delineating the columns that must be typed to their correct types AFTER the union and removing the ones not needed in the silver table :
+
+```python
+INT_COLUMNS = [
+    "elapsed_ms",
+    "new_goal",
+    "step_number",
+    "total_steps",
+    "steps_viewed",
+    "total_features",
+]
+BOOL_COLUMNS = ["is_identified", "is_change", "missing_email", "cached_token_present"]
+
+# Out of scope columns that aren't needed (system and auth-plumbing events)
+EXCLUDED_EVENTS = [
+    "$set",
+    "$identify",
+    "signin_stale_token_found",
+    "signin_stale_token_deleted",
+    "supabase_token_retry",
+]
+```
+
+Now, creating the unioned dataset that performs data quality checks, combines the two sources, and types them correctly
+
+***Note***:`stream_conformed` is the name of a Python function, not a DataFrame. 
+Hence, the DataFrame/DataStream Reader API must be used whenever referring to a Dataset anywhere again.
+
+Temp View is a source to a Streaming Table -> DataStream Reader API
+Temp View is a source to a Materialized View -> DataFrame Reader API
+
+```python
+@dp.temporary_view()
+@dp.expect_all_or_drop({
+    'uuid_present': 'uuid IS NOT NULL',
+    'event_time_present': 'event_time IS NOT NULL'
+})
+@dp.expect('event_time_not_in_future', 'event_time <= current_time() + INTERVAL 1 DAY') # one-day buffer to avoid warning from trivial clock skews
+def events_unioned():
+    unioned = spark.readStream.table('stream_conformed').unionByName(spark.readStream.table('batch_conformed')) # DS Reader API to refer datasets
+    for name in INT_COLUMNS:
+        unioned = unioned.withColumn(name, F.col(name).try_cast('bigint'))
+    for name in BOOL_COLUMNS:
+        unioned = unioned.withColumn(name, F.col(name).try_cast('boolean'))
+    return (
+        unioned.filter(~F.col('event').isin(EXCLUDED_EVENTS)) \
+            .withColumn('_source_priority', F.when(col('source') = 'batch', 1).otherwise(0))
+    )
+```
+
+`_source_priority`: When an event exists in both sources, the two copies sometimes disagree on event time by milliseconds upto about minutes. The pipeline has to pick one, and it picks batch since it's PostHog's final version of the event.
+
+Hence, the stream source allows near real-time ingestion of events while the batch source is delayed but the final version fo the event in our pipeline.
+
+Finally, upserting into the Silver table using Auto CDC
+We upsert even though events inherently are append-only because we have two sources of truths for events into the pipeline which may append the same event in different runs of the pipeline
+
+```python
+dp.create_streaming_table(
+    name='apex.silver.events',
+    comment='All PostHog events from the stream and the batch bronze tables, typed, scoped and deduplicated on uuid. When an event arrives from both sources, the batch copy is kept."
+)
+
+dp.create_auto_cdc_flow(
+    target='apex.silver.events',
+    source='events_unioned', # As AUTO CDC requires source input, this is why DataStream Reader API was used to define it
+    keys=['uuid'],
+    sequence_by=F.struct('_source_priority', '_ingested_at'),
+    except_column_list=['_source_priority'],
+    stored_as_scd_type=1
+)
+```
+
+`sequence_by` accepts only one column. The documented way to sequence by several columns is to wrap them in a struct and then pass them.
+A struct is still one column, but Spark compares structs field by field: compare `_source_priority` first, `_ingested_at` as a tie-breaker
