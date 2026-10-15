@@ -403,8 +403,8 @@ To connect with EventHub, it is treated like Kafka - the namespace is the Kafka 
 `apex.bronze.stream_events`: One JSON String per event in `body` + partition, offset, enqueued_at, _ingested_at
 `apex.bronze.batch_events`: Core columns (uuid, event, timestamp) + `properties` column of type JSON Object/Map `map<string, string>`
 
-Stream -> JSON String with plain names (city, session_id) in the `body` column, because the webhook template renamed them.
-Batch -> PostHog’s original names inside the JSON Map ($geoip_city_name, $session_id), all values as text ("402", "true").
+Stream -> JSON String with expected names (city, session_id) in the `body` column, because the webhook template renamed them.
+Batch -> PostHog’s original names inside the JSON Map `properties` ($geoip_city_name, $session_id), having all values as text ("402", "true").
 
 - The 4 Datasets
 `stream_conformed`: Temporary View. Used to parse the JSON String and pivot each key into a column
@@ -412,7 +412,8 @@ Batch -> PostHog’s original names inside the JSON Map ($geoip_city_name, $sess
 `events_unioned`: Temporary View. Used to combine the two via `unionByName`, type the columns, and performs data quality checks
 `apex.silver.events`: Streaming Table. Used to dedup on `uuid` using AUTO CDC
 
-How are we merging two sources having different schema? Conform both to one schema, convert all columns to StringType(), union them, then cast back
+How do we merge two sources having different schema? 
+Conform both to one schema, convert all columns to `StringType()`, union them, then cast back
 
 #### PROPERTY FIELDS and CORE FIELDS
 
@@ -458,7 +459,8 @@ PROPERTY_FIELDS = {
 }
 ```
 
-To define the SCHEMA of the Stream Events data, we're using the keys in `PROPERTY_FIELDS` as well as a `CORE_FIELDS` list which is essentially all the remaining fields in the Stream Events outside of the fields listed in `PROPERTY_FIELDS`
+Using the KEYS in `PROPERTY_FIELDS` AND a `CORE_FIELDS` list to define the SCHEMA of Stream Events.
+`CORE_FIELDS` is essentially all the remaining fields in the `body` of Stream Events other that the fields listed in `PROPERTY_FIELDS`
 
 ```python
 CORE_FIELDS = ["uuid", "event", "timestamp", "captured_at", "distinct_id", "person_id"]
@@ -478,13 +480,13 @@ def stream_conformed():
         parsed.select(
             F.col('e.uuid').alias('uuid'), # explicit casting of CORE_FIELDS first
             F.col('e.event').alias('event'),
-            F.col('e.timestamp').cast(Timestamp()).alias('event_time'),
-            F.col('e.captured_at').cast(Timestamp()).alias('captured_at'),
+            F.col('e.timestamp').cast(Timestamp()).alias('event_time'), # timestamp of when event occured
+            F.col('e.captured_at').cast(Timestamp()).alias('captured_at'), # timestamp of when posthog captured it
             F.col('e.distinct_id').alias('distinct_id'),
             F.col('e.person_id').alias('person_id'),
-            *[F.col(f'e.{name}').alias(f'{name}') for name in PROPERTY_FIELD], # *[] unpacks all elements of the list of column expressions
+            *[F.col(f'e.{name}').alias(f'{name}') for name in PROPERTY_FIELD], # *[] unpacks the elements in a list (all column expressions here)
             F.lit('stream').alias('source'),
-            F.col('_ingested_at')
+            F.col('_ingested_at') # timestamp of when it was ingested into the bronze layer
         )
     )
 ```
@@ -493,7 +495,8 @@ def stream_conformed():
 `PROPERTY_FIELD`: Iterating over a dictionary directly only gives access to its keys
 `PROPERTY_FIELDS.items()`: Iterating with .items() over the dictionary gives access to its key-value pairs
 
-Now, the CORE_FIELDS already exist in the Batch Events as columns, so keeping them as it is. Then, extracting PROPERTY_FIELDS from the 'property' map with renamed column headers
+First, the CORE_FIELDS already exist in Batch Events as top-level columns, so keeping them as it is. 
+Then, extracting PROPERTY_FIELDS as renamed columns from the `property` JSON Map
 
 ```python
 @dp.temporary_view()
@@ -506,28 +509,21 @@ def batch_events():
             F.lit(None).cast(Timestamp()).alias('captured_at'), # lit(None) == NULL - thus, can be converted to any data type
             F.col('distinct_id'),
             F.col('person_id'),
-            *[F.col(f'{val}').alias(f'{key}') for key, val in PROPERTY_FIELDS.items()]
-            F.lit('batch').alias('source')
+            *[F.col('properties')[val].alias(key) for key, val in PROPERTY_FIELDS.items()],
+            F.lit('batch').alias('source'),
             F.col('_ingested_at')
         )
     )
 ```
 
 Both `stream_conformed` and `batch_conformed` have the same schema and hence, are union-compatible
-Delineating the columns that must be typed to their correct types AFTER the union and removing the ones not needed in the silver table :
+Delineating the columns that must be casted to their correct types AFTER the union and filtering out rows not needed in the silver table :
 
 ```python
-INT_COLUMNS = [
-    "elapsed_ms",
-    "new_goal",
-    "step_number",
-    "total_steps",
-    "steps_viewed",
-    "total_features",
-]
+INT_COLUMNS = ["elapsed_ms", "new_goal", "step_number", "total_steps", "steps_viewed", "total_features"]
 BOOL_COLUMNS = ["is_identified", "is_change", "missing_email", "cached_token_present"]
 
-# Out of scope columns that aren't needed (system and auth-plumbing events)
+# Out of scope rows that aren't needed (system and auth-plumbing events)
 EXCLUDED_EVENTS = [
     "$set",
     "$identify",
@@ -560,13 +556,13 @@ def events_unioned():
         unioned = unioned.withColumn(name, F.col(name).try_cast('boolean'))
     return (
         unioned.filter(~F.col('event').isin(EXCLUDED_EVENTS)) \
-            .withColumn('_source_priority', F.when(col('source') = 'batch', 1).otherwise(0))
+            .withColumn('_source_priority', F.when(col('source') == 'batch', 1).otherwise(0))
     )
 ```
 
 `_source_priority`: When an event exists in both sources, the two copies sometimes disagree on event time by milliseconds upto about minutes. The pipeline has to pick one, and it picks batch since it's PostHog's final version of the event.
 
-Hence, the stream source allows near real-time ingestion of events while the batch source is delayed but the final version fo the event in our pipeline.
+Hence, the stream source allows near real-time ingestion of events while the batch source is delayed but the final version of the event in our pipeline. A stream-only event is replaced only if a batch copy arrives
 
 Finally, upserting into the Silver table using Auto CDC
 We upsert even though events inherently are append-only because we have two sources of truths for events into the pipeline which may append the same event in different runs of the pipeline
@@ -579,7 +575,7 @@ dp.create_streaming_table(
 
 dp.create_auto_cdc_flow(
     target='apex.silver.events',
-    source='events_unioned', # As AUTO CDC requires source input, this is why DataStream Reader API was used to define it
+    source='events_unioned', # AUTO CDC requires stream source input, hence all prior temp views are required to be read by DS Reader API
     keys=['uuid'],
     sequence_by=F.struct('_source_priority', '_ingested_at'),
     except_column_list=['_source_priority'],
@@ -589,3 +585,110 @@ dp.create_auto_cdc_flow(
 
 `sequence_by` accepts only one column. The documented way to sequence by several columns is to wrap them in a struct and then pass them.
 A struct is still one column, but Spark compares structs field by field: compare `_source_priority` first, `_ingested_at` as a tie-breaker
+
+### silver_dimensions.py
+
+Defining three tables in a single script for each of the `[users, workouts, gyms]` bronze tables with each being a materialized view
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+@dp.materialized_view(
+    name='apex.silver.users'
+)
+def users():
+    return (
+        spark.read.table('apex.bronze.users').select(
+            F.col("id").alias("user_id"),
+            F.col("email_hash"),
+            F.lower(F.trim("email_domain")).alias("email_domain"),
+            F.col("first_name_masked"),
+            F.col("last_name_masked"),
+            F.col("username_masked"),
+            F.col("created_at").cast("timestamp"),
+            F.col("updated_at").cast("timestamp"),
+            F.col("file_modification_time").alias("loaded_at"),
+        )
+    )
+```
+
+'muscle_groups' is an array column in PostgreSQL. However, while copying into the Data Lake, ADF converts it into a single string field formatted with curly braces: `"{'Chest', 'Triceps', 'Shoulders'}"`
+Thus, before defining the Materialized View for the workouts table, creating a function that parses the string type column back into an array
+
+```python
+def parse_string_array(column_name):
+    cleaned = F.regexp_replace(col(column_name), "[{}'']", '')
+    return (
+        F.when(F.col(column_name).isNull() | cleaned == '', F.array().cast('array<string>')) \
+            .otherwise(F.split(cleaned, ','))
+    )
+```
+
+`F.split(cleaned, ',')` returns an array column from a string column. But, `null` (no value) and `{}` (empty value) would return `null` and `['']` (array with one element) respectively. Hence, 'when' deals with those two edge cases first by casting both to an empty array `[]`
+
+```python
+@dp.materialized_view(
+    name='apex.silver.workouts',
+    comment='Workouts per user and per split, with muscle groups parsed'
+)
+@dp.expect_or_fail('workout_id_present', 'workout_id IS NOT NULL')
+@dp.expect_all({'user_id_present': 'user_id IS NOT NULL', 'workout_name_present': 'workout_name IS NOT NULL'})
+def workouts():
+    return (
+        spark.read.table('apex.bronze.workouts').select(
+            F.col('id').alias('workout_id'),
+            F.col('user_id'),
+            F.col('split_id'),
+            F.trim('workout_name').alias('workout_name'),
+            F.lower(F.trim("workout_name")).alias("workout_name_key"),
+            F.trim("day").alias("day_label"),
+            F.regexp_extract('day', '(\\d)', 1).try_cast('int').alias('day_number'),
+            F.col('order_index').cast('int'),
+            parse_string_array('muscle_groups').alias('muscle_groups'),
+            F.col("created_at").cast("timestamp"),
+            F.col("updated_at").cast("timestamp"),
+            F.col("file_modification_time").alias("loaded_at"),
+        )
+    )
+```
+
+Defining the 'gyms' dataset which expands the dataset vertically by unpivoting to one row per user per gym - primary and secondary gyms into seperate rows with a `gym_slot` column.
+
+```python
+@dp.materialized_view(
+    name='apex.silver.gyms'
+    comment="Each user's gym(s) with one row per slot. Exact addresses and coordinates are dropped"
+)
+@dp.expect_all_or_drop({'user_id_present': 'user_id IS NOT NULL', 'place_id_present': 'place_id IS NOT NULL'})
+def gyms():
+
+    shared = [
+        F.col('id').alias('gym_record_id'),
+        F.col('user_id'),
+        F.col('gym_change_count').cast('int'),
+        F.col('is_geofencing_active').cast('int'),
+        F.col('is_geofencing_active').cast('boolean'),
+        F.col('updated_at').cast('timestamp'),
+        F.col('file_modification_time').alias('loaded_at')
+    ]
+
+    primary = spark.read.table('apex.bronze.gyms').select(
+        *shared,
+        F.lit('primary').alias('gym_slot'),
+        F.col('place_id'),
+        F.col('place_name'),
+        F.col('created_at').cast('timestamp').alias('slot_set_at')
+    )
+
+    secondary = spark.read.table('apex.bronze.gyms').filter(col('secondary_place_id').isNotNull()).select(
+        *shared,
+        F.lit('secondary').alias('gym_slot'),
+        F.col('secondary_place_id').alias('gym_slot'),
+        F.col('secondary_place_id').alias('place_id'),
+        F.col('secondary_place_name').alias('place_name'),
+        F.col('secondary_first_set_at').cast('timestamp').alias('slot_set_at')
+    )
+
+    return primary.unionByName(secondary)
+```
